@@ -14,16 +14,22 @@ public class ImageMessage
     public string FileName { get; set; } = string.Empty;
 
     /// <summary>
-    /// The image bytes encoded as Base64.
+    /// The blob name where the source image is stored.
     /// </summary>
-    [JsonPropertyName("imageData")]
-    public string ImageData { get; set; } = string.Empty;
+    [JsonPropertyName("blobName")]
+    public string BlobName { get; set; } = string.Empty;
 
     /// <summary>
     /// The content type of the image (e.g., "image/png", "image/jpeg").
     /// </summary>
     [JsonPropertyName("contentType")]
     public string ContentType { get; set; } = string.Empty;
+
+    /// <summary>
+    /// The size of the image in bytes.
+    /// </summary>
+    [JsonPropertyName("sizeBytes")]
+    public long SizeBytes { get; set; }
 
     /// <summary>
     /// Timestamp when the image was enqueued.

@@ -18,6 +18,7 @@ namespace ImageQueueProcessor.Services;
 
 /// <summary>
 /// Implementation of IProcessService that processes images from Azure Storage Queue.
+/// Downloads source images from blob storage, resizes them, and uploads to the output container.
 /// </summary>
 public class ProcessService : IProcessService
 {
@@ -33,25 +34,28 @@ public class ProcessService : IProcessService
     public async Task<bool> ProcessQueueAsync(bool dryRun, CancellationToken cancellationToken = default)
     {
         _logger.LogInformation("Starting process operation. DryRun: {DryRun}", dryRun);
-        _logger.LogInformation("Queue name: {QueueName}, Container: {Container}", 
-            _settings.QueueName, _settings.ResizedImagesContainer);
+        _logger.LogInformation("Queue name: {QueueName}, Source container: {SourceContainer}, Output container: {OutputContainer}", 
+            _settings.QueueName, _settings.SourceImagesContainer, _settings.ResizedImagesContainer);
 
         var queueClient = new QueueClient(_settings.ConnectionString, _settings.QueueName);
         await queueClient.CreateIfNotExistsAsync(cancellationToken: cancellationToken);
         _logger.LogInformation("Queue ensured to exist: {QueueName}", _settings.QueueName);
 
-        BlobContainerClient? containerClient = null;
+        var blobServiceClient = new BlobServiceClient(_settings.ConnectionString);
+        var sourceContainerClient = blobServiceClient.GetBlobContainerClient(_settings.SourceImagesContainer);
+        BlobContainerClient? outputContainerClient = null;
+        
         if (!dryRun)
         {
-            var blobServiceClient = new BlobServiceClient(_settings.ConnectionString);
-            containerClient = blobServiceClient.GetBlobContainerClient(_settings.ResizedImagesContainer);
-            await containerClient.CreateIfNotExistsAsync(cancellationToken: cancellationToken);
-            _logger.LogInformation("Container ensured to exist: {Container}", _settings.ResizedImagesContainer);
+            outputContainerClient = blobServiceClient.GetBlobContainerClient(_settings.ResizedImagesContainer);
+            await outputContainerClient.CreateIfNotExistsAsync(cancellationToken: cancellationToken);
+            _logger.LogInformation("Output container ensured to exist: {Container}", _settings.ResizedImagesContainer);
         }
 
-        int messagesProcessed = 0;
-        int blobsUploaded = 0;
-        int messagesFailed = 0;
+        // Track results for summary
+        var processedFiles = new List<(string FileName, int OrigWidth, int OrigHeight, int NewWidth, int NewHeight, long OriginalSize)>();
+        var skippedFiles = new List<(string FileName, string Reason)>();
+        var failedFiles = new List<(string FileName, string Error)>();
 
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -76,12 +80,17 @@ public class ProcessService : IProcessService
                         if (imageMessage == null)
                         {
                             _logger.LogWarning("[DRY-RUN] Could not deserialize message");
-                            messagesFailed++;
+                            failedFiles.Add(("Unknown", "Could not deserialize message"));
                             continue;
                         }
 
-                        var imageBytes = Convert.FromBase64String(imageMessage.ImageData);
-                        using var image = Image.Load(imageBytes);
+                        // Download source image from blob
+                        var sourceBlobClient = sourceContainerClient.GetBlobClient(imageMessage.BlobName);
+                        using var downloadStream = new MemoryStream();
+                        await sourceBlobClient.DownloadToAsync(downloadStream, cancellationToken);
+                        downloadStream.Position = 0;
+
+                        using var image = await Image.LoadAsync(downloadStream, cancellationToken);
                         var newWidth = image.Width / 2;
                         var newHeight = image.Height / 2;
 
@@ -90,15 +99,15 @@ public class ProcessService : IProcessService
                         _logger.LogInformation("[DRY-RUN] Would process: {FileName} ({Width}x{Height} -> {NewWidth}x{NewHeight})",
                             imageMessage.FileName, image.Width, image.Height, newWidth, newHeight);
                         _logger.LogInformation("[DRY-RUN] Would upload as: {OutputFileName}", outputFileName);
+                        _logger.LogInformation("[DRY-RUN] Would delete source blob: {BlobName}", imageMessage.BlobName);
                         _logger.LogInformation("[DRY-RUN] Would delete queue message for: {FileName}", imageMessage.FileName);
                         
-                        messagesProcessed++;
-                        blobsUploaded++;
+                        processedFiles.Add((imageMessage.FileName, image.Width, image.Height, newWidth, newHeight, imageMessage.SizeBytes));
                     }
                     catch (Exception ex)
                     {
                         _logger.LogError(ex, "[DRY-RUN] Error processing message");
-                        messagesFailed++;
+                        failedFiles.Add(("Unknown", ex.Message));
                     }
                 }
                 
@@ -119,23 +128,38 @@ public class ProcessService : IProcessService
 
                 foreach (var message in messages)
                 {
+                    string currentFileName = "Unknown";
                     try
                     {
                         var imageMessage = JsonSerializer.Deserialize<ImageMessage>(message.MessageText);
                         if (imageMessage == null)
                         {
                             _logger.LogWarning("Could not deserialize message {MessageId}", message.MessageId);
-                            messagesFailed++;
+                            failedFiles.Add(("Unknown", "Could not deserialize message"));
                             continue;
                         }
 
-                        _logger.LogInformation("Processing: {FileName}", imageMessage.FileName);
+                        currentFileName = imageMessage.FileName;
+                        _logger.LogInformation("Processing: {FileName} (blob: {BlobName})", imageMessage.FileName, imageMessage.BlobName);
 
-                        var imageBytes = Convert.FromBase64String(imageMessage.ImageData);
+                        // Download source image from blob
+                        var sourceBlobClient = sourceContainerClient.GetBlobClient(imageMessage.BlobName);
+                        
+                        // Check if blob exists (handles orphaned queue messages)
+                        if (!await sourceBlobClient.ExistsAsync(cancellationToken))
+                        {
+                            _logger.LogWarning("Source blob not found: {BlobName}. Deleting orphaned queue message.", imageMessage.BlobName);
+                            await queueClient.DeleteMessageAsync(message.MessageId, message.PopReceipt, cancellationToken);
+                            skippedFiles.Add((imageMessage.FileName, "Source blob not found (orphaned message)"));
+                            continue;
+                        }
+                        
+                        using var downloadStream = new MemoryStream();
+                        await sourceBlobClient.DownloadToAsync(downloadStream, cancellationToken);
+                        downloadStream.Position = 0;
                         
                         // Resize image
-                        using var inputStream = new MemoryStream(imageBytes);
-                        using var image = await Image.LoadAsync(inputStream, cancellationToken);
+                        using var image = await Image.LoadAsync(downloadStream, cancellationToken);
                         
                         var originalWidth = image.Width;
                         var originalHeight = image.Height;
@@ -156,37 +180,105 @@ public class ProcessService : IProcessService
                         await image.SaveAsync(outputStream, encoder, cancellationToken);
                         outputStream.Position = 0;
 
-                        // Upload to blob
+                        // Upload to output container
                         var outputFileName = GetOutputFileName(imageMessage.FileName);
-                        var blobClient = containerClient!.GetBlobClient(outputFileName);
+                        var outputBlobClient = outputContainerClient!.GetBlobClient(outputFileName);
                         
-                        await blobClient.UploadAsync(outputStream, new BlobHttpHeaders
+                        await outputBlobClient.UploadAsync(outputStream, new BlobHttpHeaders
                         {
                             ContentType = imageMessage.ContentType
                         }, cancellationToken: cancellationToken);
                         
                         _logger.LogInformation("Uploaded: {OutputFileName}", outputFileName);
-                        blobsUploaded++;
+
+                        // Delete source blob after successful processing
+                        await sourceBlobClient.DeleteIfExistsAsync(cancellationToken: cancellationToken);
+                        _logger.LogInformation("Deleted source blob: {BlobName}", imageMessage.BlobName);
 
                         // Delete message only after successful upload
                         await queueClient.DeleteMessageAsync(message.MessageId, message.PopReceipt, cancellationToken);
                         _logger.LogInformation("Deleted queue message for: {FileName}", imageMessage.FileName);
-                        messagesProcessed++;
+                        
+                        processedFiles.Add((imageMessage.FileName, originalWidth, originalHeight, newWidth, newHeight, imageMessage.SizeBytes));
                     }
                     catch (Exception ex)
                     {
                         _logger.LogError(ex, "Failed to process message {MessageId}", message.MessageId);
-                        messagesFailed++;
+                        failedFiles.Add((currentFileName, ex.Message));
                         // Do not delete the message on failure - it will become visible again
                     }
                 }
             }
         }
 
-        _logger.LogInformation("Process summary: Processed={Processed}, Uploaded={Uploaded}, Failed={Failed}",
-            messagesProcessed, blobsUploaded, messagesFailed);
+        PrintSummary(processedFiles, skippedFiles, failedFiles, dryRun);
 
-        return messagesFailed == 0;
+        return failedFiles.Count == 0;
+    }
+
+    private static void PrintSummary(
+        List<(string FileName, int OrigWidth, int OrigHeight, int NewWidth, int NewHeight, long OriginalSize)> processed,
+        List<(string FileName, string Reason)> skipped,
+        List<(string FileName, string Error)> failed,
+        bool dryRun)
+    {
+        Console.WriteLine();
+        Console.WriteLine(new string('=', 60));
+        Console.WriteLine(dryRun ? "  PROCESS SUMMARY (DRY RUN)" : "  PROCESS SUMMARY");
+        Console.WriteLine(new string('=', 60));
+        Console.WriteLine();
+
+        // Processed files
+        Console.WriteLine($"✓ PROCESSED: {processed.Count} image(s)");
+        if (processed.Count > 0)
+        {
+            var totalSize = processed.Sum(f => f.OriginalSize);
+            foreach (var (fileName, origW, origH, newW, newH, size) in processed)
+            {
+                Console.WriteLine($"    • {fileName}");
+                Console.WriteLine($"      {origW}x{origH} → {newW}x{newH} ({FormatFileSize(size)})");
+            }
+            Console.WriteLine($"    Total original size: {FormatFileSize(totalSize)}");
+        }
+        Console.WriteLine();
+
+        // Skipped files (orphaned messages, etc.)
+        Console.WriteLine($"⊘ SKIPPED: {skipped.Count} image(s)");
+        if (skipped.Count > 0)
+        {
+            foreach (var (fileName, reason) in skipped)
+            {
+                Console.WriteLine($"    • {fileName}");
+                Console.WriteLine($"      Reason: {reason}");
+            }
+        }
+        Console.WriteLine();
+
+        // Failed files
+        Console.WriteLine($"✗ FAILED: {failed.Count} image(s)");
+        if (failed.Count > 0)
+        {
+            foreach (var (fileName, error) in failed)
+            {
+                Console.WriteLine($"    • {fileName}");
+                Console.WriteLine($"      Error: {error}");
+            }
+        }
+        Console.WriteLine();
+        Console.WriteLine(new string('=', 60));
+    }
+
+    private static string FormatFileSize(long bytes)
+    {
+        string[] sizes = ["B", "KB", "MB", "GB"];
+        int order = 0;
+        double size = bytes;
+        while (size >= 1024 && order < sizes.Length - 1)
+        {
+            order++;
+            size /= 1024;
+        }
+        return $"{size:0.##} {sizes[order]}";
     }
 
     private static string GetOutputFileName(string originalFileName)

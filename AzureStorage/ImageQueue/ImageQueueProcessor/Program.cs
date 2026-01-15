@@ -13,10 +13,9 @@ var dryRunOption = new Option<bool>("--dry-run")
     DefaultValueFactory = _ => false
 };
 
-var folderOption = new Option<string>("--folder")
+var folderOption = new Option<string?>("--folder")
 {
-    Description = "The folder containing images to enqueue",
-    Required = true
+    Description = "The folder containing images to enqueue. Defaults to %AppData%/MyStorageApp/sourceimages"
 };
 
 var patternOption = new Option<string>("--pattern")
@@ -49,7 +48,7 @@ var rootCommand = new RootCommand("Image Queue Processor - Enqueue images to Azu
 // Set up handlers using SetAction (System.CommandLine 2.0.2 API)
 enqueueCommand.SetAction(async (parseResult, cancellationToken) =>
 {
-    var folder = parseResult.GetValue(folderOption)!;
+    var folder = ResolveSourceImagesFolder(parseResult.GetValue(folderOption));
     var pattern = parseResult.GetValue(patternOption) ?? "*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp";
     var dryRun = parseResult.GetValue(dryRunOption);
 
@@ -67,6 +66,19 @@ processCommand.SetAction(async (parseResult, cancellationToken) =>
 
 // Execute using Parse().InvokeAsync()
 return await rootCommand.Parse(args).InvokeAsync();
+
+// Helper to resolve source images folder path
+string ResolveSourceImagesFolder(string? folder)
+{
+    if (!string.IsNullOrWhiteSpace(folder))
+    {
+        return folder;
+    }
+
+    // Default to %AppData%/MyStorageApp/sourceimages
+    var appDataPath = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+    return Path.Combine(appDataPath, "MyStorageApp", "sourceimages");
+}
 
 // Helper methods for running commands
 async Task<(bool Success, int ExitCode)> RunEnqueueAsync(string folder, string pattern, bool dryRun, CancellationToken cancellationToken)
