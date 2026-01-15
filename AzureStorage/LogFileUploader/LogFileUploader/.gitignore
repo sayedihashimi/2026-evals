@@ -1,0 +1,6 @@
+# User secrets - do not commit
+appsettings.json.user
+
+# Build outputs
+bin/
+obj/
