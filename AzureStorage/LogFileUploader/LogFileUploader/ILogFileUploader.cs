@@ -25,10 +25,18 @@ public interface ILogFileUploader
 /// <summary>
 /// Result of the upload operation.
 /// </summary>
+/// <param name="Success">Whether the operation completed without failures.</param>
+/// <param name="FilesProcessed">Total number of files processed.</param>
+/// <param name="FilesUploaded">Number of files successfully uploaded.</param>
+/// <param name="FilesSkipped">Number of files skipped (empty, too large, or in use).</param>
+/// <param name="FilesDeleted">Number of files deleted after upload.</param>
+/// <param name="FilesFailed">Number of files that failed to upload.</param>
+/// <param name="Errors">List of error messages for failed operations.</param>
 public record UploadResult(
     bool Success,
     int FilesProcessed,
     int FilesUploaded,
+    int FilesSkipped,
     int FilesDeleted,
     int FilesFailed,
-    List<string> Errors);
+    IReadOnlyList<string> Errors);

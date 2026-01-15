@@ -11,7 +11,8 @@
   <ItemGroup>
     <PackageReference Include="Azure.Storage.Blobs" Version="12.24.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0-preview.1.25080.5" />
-    <PackageReference Include="System.CommandLine" Version="2.0.0-beta4.22272.1" />
+    <PackageReference Include="Polly" Version="8.5.2" />
+    <PackageReference Include="System.CommandLine" Version="2.0.2" />
   </ItemGroup>
 
   <ItemGroup>

@@ -3,6 +3,8 @@ using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Polly;
+using Polly.Retry;
 
 namespace LogFileUploader;
 
@@ -14,7 +16,9 @@ public class LogFileUploaderService : ILogFileUploader
     private readonly BlobUploadSettings _options;
     private readonly ILogger<LogFileUploaderService> _logger;
     private readonly BlobContainerClient _containerClient;
+    private readonly SemaphoreSlim _containerEnsureLock = new(1, 1);
     private bool _containerEnsured = false;
+    private readonly ResiliencePipeline _retryPipeline;
 
     public LogFileUploaderService(
         IOptions<BlobUploadSettings> options,
@@ -30,8 +34,36 @@ public class LogFileUploaderService : ILogFileUploader
                 "Set it in appsettings.json.user or via environment variable BlobUpload__ConnectionString.");
         }
 
+        if (!_options.IsValidBlobPrefix())
+        {
+            throw new InvalidOperationException(
+                $"Invalid blob prefix: '{_options.BlobPrefix}'. " +
+                "Prefix cannot start with '/' or contain consecutive slashes.");
+        }
+
         var blobServiceClient = new BlobServiceClient(_options.ConnectionString);
         _containerClient = blobServiceClient.GetBlobContainerClient(_options.ContainerName);
+
+        // Configure retry pipeline for transient failures
+        _retryPipeline = new ResiliencePipelineBuilder()
+            .AddRetry(new RetryStrategyOptions
+            {
+                MaxRetryAttempts = _options.MaxRetryAttempts,
+                Delay = TimeSpan.FromMilliseconds(_options.RetryDelayMilliseconds),
+                BackoffType = DelayBackoffType.Exponential,
+                ShouldHandle = new PredicateBuilder().Handle<RequestFailedException>(ex =>
+                    ex.Status is 408 or 429 or 500 or 502 or 503 or 504),
+                OnRetry = args =>
+                {
+                    _logger.LogWarning(
+                        "Retry attempt {Attempt} after {Delay}ms due to: {Message}",
+                        args.AttemptNumber,
+                        args.RetryDelay.TotalMilliseconds,
+                        args.Outcome.Exception?.Message);
+                    return ValueTask.CompletedTask;
+                }
+            })
+            .Build();
     }
 
     public async Task<UploadResult> UploadFilesAsync(
@@ -44,6 +76,7 @@ public class LogFileUploaderService : ILogFileUploader
         var errors = new List<string>();
         int filesProcessed = 0;
         int filesUploaded = 0;
+        int filesSkipped = 0;
         int filesDeleted = 0;
         int filesFailed = 0;
 
@@ -66,11 +99,21 @@ public class LogFileUploaderService : ILogFileUploader
 
             try
             {
-                _logger.LogInformation("Processing file: {FileName}", fileName);
+                _logger.LogDebug("Processing file: {FileName}", fileName);
+
+                // Validate file before upload
+                var validationResult = ValidateFile(filePath, fileName);
+                if (!validationResult.IsValid)
+                {
+                    filesSkipped++;
+                    _logger.LogInformation("Skipping {FileName}: {Reason}", fileName, validationResult.Reason);
+                    continue;
+                }
 
                 if (dryRun)
                 {
-                    _logger.LogInformation("[DRY RUN] Would upload {FileName} to blob {BlobName}", fileName, blobName);
+                    _logger.LogInformation("[DRY RUN] Would upload {FileName} ({Size:N0} bytes) to blob {BlobName}", 
+                        fileName, validationResult.FileSize, blobName);
                     filesUploaded++;
 
                     if (deleteAfterUpload)
@@ -81,10 +124,14 @@ public class LogFileUploaderService : ILogFileUploader
                 }
                 else
                 {
-                    // Upload the file
-                    await UploadFileAsync(filePath, blobName, cancellationToken);
+                    // Upload the file with retry logic
+                    await _retryPipeline.ExecuteAsync(
+                        async ct => await UploadFileAsync(filePath, blobName, ct),
+                        cancellationToken);
+                    
                     filesUploaded++;
-                    _logger.LogInformation("Successfully uploaded {FileName} to blob {BlobName}", fileName, blobName);
+                    _logger.LogInformation("Successfully uploaded {FileName} ({Size:N0} bytes) to blob {BlobName}", 
+                        fileName, validationResult.FileSize, blobName);
 
                     // Delete the file if requested
                     if (deleteAfterUpload)
@@ -101,6 +148,11 @@ public class LogFileUploaderService : ILogFileUploader
                 var errorMessage = $"Failed to upload {fileName}: {ex.Message} (Status: {ex.Status})";
                 errors.Add(errorMessage);
                 _logger.LogError(ex, "Azure Storage error uploading {FileName}", fileName);
+            }
+            catch (IOException ex) when (IsFileLocked(ex))
+            {
+                filesSkipped++;
+                _logger.LogWarning("Skipping {FileName}: File is in use by another process", fileName);
             }
             catch (IOException ex)
             {
@@ -121,15 +173,65 @@ public class LogFileUploaderService : ILogFileUploader
         var success = filesFailed == 0;
         
         _logger.LogInformation(
-            "Upload complete. Processed: {Processed}, Uploaded: {Uploaded}, Deleted: {Deleted}, Failed: {Failed}",
-            filesProcessed, filesUploaded, filesDeleted, filesFailed);
+            "Upload complete. Processed: {Processed}, Uploaded: {Uploaded}, Skipped: {Skipped}, Deleted: {Deleted}, Failed: {Failed}",
+            filesProcessed, filesUploaded, filesSkipped, filesDeleted, filesFailed);
 
-        return new UploadResult(success, filesProcessed, filesUploaded, filesDeleted, filesFailed, errors);
+        return new UploadResult(success, filesProcessed, filesUploaded, filesSkipped, filesDeleted, filesFailed, errors);
+    }
+
+    /// <summary>
+    /// Validates a file before upload based on size and age criteria.
+    /// </summary>
+    private FileValidationResult ValidateFile(string filePath, string fileName)
+    {
+        try
+        {
+            var fileInfo = new FileInfo(filePath);
+
+            // Check if file exists
+            if (!fileInfo.Exists)
+            {
+                return FileValidationResult.Invalid("File no longer exists");
+            }
+
+            // Check minimum size (skip empty files)
+            if (fileInfo.Length < _options.MinFileSizeBytes)
+            {
+                return FileValidationResult.Invalid(
+                    $"File is too small ({fileInfo.Length} bytes, minimum is {_options.MinFileSizeBytes} bytes)");
+            }
+
+            // Check maximum size
+            if (fileInfo.Length > _options.MaxFileSizeBytes)
+            {
+                return FileValidationResult.Invalid(
+                    $"File is too large ({fileInfo.Length:N0} bytes, maximum is {_options.MaxFileSizeBytes:N0} bytes)");
+            }
+
+            return FileValidationResult.Valid(fileInfo.Length);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Error validating file {FileName}", fileName);
+            return FileValidationResult.Invalid($"Validation error: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Determines if an IOException is due to a file being locked.
+    /// </summary>
+    private static bool IsFileLocked(IOException ex)
+    {
+        // Common HRESULT values for file locking errors
+        const int ERROR_SHARING_VIOLATION = unchecked((int)0x80070020);
+        const int ERROR_LOCK_VIOLATION = unchecked((int)0x80070021);
+
+        return ex.HResult == ERROR_SHARING_VIOLATION || ex.HResult == ERROR_LOCK_VIOLATION;
     }
 
     private async Task UploadFileAsync(string filePath, string blobName, CancellationToken cancellationToken)
     {
-        // Ensure container exists (only once per session)
+        // Ensure container exists (thread-safe)
         await EnsureContainerExistsAsync(cancellationToken);
 
         var blobClient = _containerClient.GetBlobClient(blobName);
@@ -171,9 +273,32 @@ public class LogFileUploaderService : ILogFileUploader
             return;
         }
 
-        _logger.LogInformation("Ensuring container '{ContainerName}' exists...", _options.ContainerName);
-        await _containerClient.CreateIfNotExistsAsync(cancellationToken: cancellationToken);
-        _containerEnsured = true;
-        _logger.LogInformation("Container '{ContainerName}' is ready", _options.ContainerName);
+        await _containerEnsureLock.WaitAsync(cancellationToken);
+        try
+        {
+            // Double-check after acquiring lock
+            if (_containerEnsured)
+            {
+                return;
+            }
+
+            _logger.LogInformation("Ensuring container '{ContainerName}' exists...", _options.ContainerName);
+            await _containerClient.CreateIfNotExistsAsync(cancellationToken: cancellationToken);
+            _containerEnsured = true;
+            _logger.LogInformation("Container '{ContainerName}' is ready", _options.ContainerName);
+        }
+        finally
+        {
+            _containerEnsureLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Result of file validation.
+    /// </summary>
+    private readonly record struct FileValidationResult(bool IsValid, string? Reason, long FileSize)
+    {
+        public static FileValidationResult Valid(long fileSize) => new(true, null, fileSize);
+        public static FileValidationResult Invalid(string reason) => new(false, reason, 0);
     }
 }
