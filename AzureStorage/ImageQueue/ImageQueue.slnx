@@ -1,1 +1,3 @@
-<Solution />
+<Solution>
+  <Project Path="ImageQueueProcessor/ImageQueueProcessor.csproj" />
+</Solution>
