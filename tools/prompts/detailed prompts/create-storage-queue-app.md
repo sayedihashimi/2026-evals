@@ -3,6 +3,7 @@ PROMPT FILE: Create .NET 10 app that enqueues images to Azure Storage Queue and 
 You are modifying an EXISTING repository that already contains a .NET solution file (.sln or .slnx). Create a NEW .NET 10 console application project and add it to the existing solution. After generating the code, it MUST build and run successfully. If it doesn’t, iterate on the code until it works (no further user interaction).
 
 ============================================================
+
 GOAL
 
 Create a .NET 10 console app that supports TWO operations:
@@ -24,6 +25,7 @@ Include a CLI option: --dry-run
 - In dry-run, do NOT enqueue messages, do NOT delete local files, do NOT upload blobs, and do NOT delete queue messages. Only log what WOULD happen.
 
 ============================================================
+
 TECH REQUIREMENTS
 
 - Target framework: net10.0
@@ -36,6 +38,7 @@ TECH REQUIREMENTS
 - Ensure the app is cross-platform (no Windows-only imaging APIs). Use a cross-platform image library for resizing (for example: SixLabors.ImageSharp) and include the necessary NuGet reference.
 
 ============================================================
+
 PROJECT CREATION / SOLUTION INTEGRATION
 
 - Project name: ImageQueueProcessor (or a similar unique name if collision exists)
@@ -44,6 +47,7 @@ PROJECT CREATION / SOLUTION INTEGRATION
 - Ensure: dotnet build succeeds
 
 ============================================================
+
 CONFIGURATION (appsettings.json + appsettings.json.user)
 
 - appsettings.json: checked in, NO secrets
@@ -72,6 +76,7 @@ Notes:
 - Fail fast with a clear error if ConnectionString is missing/empty.
 
 ============================================================
+
 CLI DESIGN (System.CommandLine)
 
 Implement subcommands (recommended) so the tool is unambiguous:
@@ -90,6 +95,7 @@ Details:
 Also support --help and reasonable validation/error messages.
 
 ============================================================
+
 ENQUEUE BEHAVIOR DETAILS
 
 For each image file matched in the folder:
@@ -116,6 +122,7 @@ IMPORTANT: Azure Storage Queue messages have size limits. Implement a safe check
 - The app must return a non-zero exit code if any file failed.
 
 ============================================================
+
 PROCESS BEHAVIOR DETAILS
 
 Processing loop:
@@ -139,6 +146,7 @@ Processing loop:
 - Exit after queue is empty
 
 ============================================================
+
 BLOB UPLOAD DETAILS
 
 - Container name comes from config: QueueProcessing:ResizedImagesContainer (default resizedimages)
@@ -147,6 +155,7 @@ BLOB UPLOAD DETAILS
 - Set content-type if feasible (nice-to-have)
 
 ============================================================
+
 LOGGING
 
 Use ILogger:
@@ -156,6 +165,7 @@ Use ILogger:
 - End summary: counts (files found, enqueued, deleted locally, messages processed, blobs uploaded, failures)
 
 ============================================================
+
 EXIT CODES
 
 - Exit 0 only if the entire run completed with no failures
@@ -164,6 +174,7 @@ EXIT CODES
   - Any enqueue/process failures (including oversized message, upload failure, delete failure) => exit 2
 
 ============================================================
+
 REQUIRED OUTPUTS / VERIFICATION
 
 - Add/commit the new project (and appsettings.json stub)
@@ -178,6 +189,7 @@ REQUIRED OUTPUTS / VERIFICATION
   - explain appsettings.json.user secret requirement
 
 ============================================================
+
 FINAL NOTE
 
 After generating the code, validate it compiles and runs. If there are any build or runtime issues (including System.CommandLine API mismatches), iterate and fix until the verification commands succeed.
