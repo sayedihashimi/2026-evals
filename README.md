@@ -15,6 +15,15 @@ Each sample is maintained on a separate branch and can be checked out independen
 
 ---
 
+## Prompt files
+
+| User prompt file | Detailed prompt file that I used to start with|
+|--------|--------|
+| [create-azfunction-github-pr-gatekeeper-user.md](tools/prompts/user%20prompts/create-azfunction-github-pr-gatekeeper-user.md) | [create-azfunction-github-pr-gatekeeper.md](tools/prompts/detailed%20prompts/create-azfunction-github-pr-gatekeeper.md) |
+| [create-azfunction-health-check-user.md](tools/prompts/user%20prompts/create-azfunction-health-check-user.md) | [create-azfunction-healthcheck.md](tools/prompts/detailed%20prompts/create-azfunction-healthcheck.md) |
+| [create-storage-logs-app-user.md](tools/prompts/user%20prompts/create-storage-logs-app-user.md) | [create-storage-logs-app.md](tools/prompts/detailed%20prompts/create-storage-logs-app.md) |
+| [create-storage-queue-app-user.md](tools/prompts/user%20prompts/create-storage-queue-app-user.md) | [create-storage-queue-app.md](tools/prompts/detailed%20prompts/create-storage-queue-app.md) |
+
 ## Sample 1: GitHub PR Gatekeeper (`azfunc-gh-pr-gatekeeper`)
 
 An Azure Function that acts as a GitHub webhook to validate Pull Requests against organizational standards.
